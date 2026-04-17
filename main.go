@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -21,7 +22,8 @@ var (
 	linearTeamID = os.Getenv("LINEAR_TEAM_ID")
 	redisAddr    = os.Getenv("REDIS_ADDR")
 	// Only monitor containers with this label set to "true"
-	monitorLabel = "watchlog.monitor"
+	monitorLabel       = "watchlog.monitor"
+	linearProjectLabel = "linear.project"
 )
 
 func main() {
@@ -49,14 +51,20 @@ func main() {
 			continue
 		}
 
-		log.Printf("Monitoring logs for: %s", cName)
-		go tailLogs(cli, rdb, c.ID, cName)
+		projectLabel := c.Labels[linearProjectLabel]
+		if projectLabel != "" {
+			log.Printf("Monitoring logs for: %s (Linear project ID: %s)", cName, projectLabel)
+		} else {
+			log.Printf("Monitoring logs for: %s", cName)
+		}
+
+		go tailLogs(cli, rdb, c.ID, cName, projectLabel)
 	}
 
 	select {} // Block forever
 }
 
-func tailLogs(cli *client.Client, rdb *redis.Client, containerID, name string) {
+func tailLogs(cli *client.Client, rdb *redis.Client, containerID, name, projectLabel string) {
 	options := container.LogsOptions{ShowStdout: true, ShowStderr: true, Follow: true, Tail: "0"}
 	stream, err := cli.ContainerLogs(ctx, containerID, options)
 	if err != nil {
@@ -73,7 +81,9 @@ func tailLogs(cli *client.Client, rdb *redis.Client, containerID, name string) {
 			upperLine := strings.ToUpper(line)
 
 			if strings.Contains(upperLine, "ERROR") || strings.Contains(upperLine, "WARNING") {
-				processAlert(rdb, name, line)
+				metadata := getExtendedMetadata(cli, containerID)
+				b, _ := json.MarshalIndent(metadata, "", "  ")
+				processAlert(rdb, name, line, projectLabel, string(b))
 			}
 		}
 		if err == io.EOF {
@@ -85,9 +95,9 @@ func tailLogs(cli *client.Client, rdb *redis.Client, containerID, name string) {
 	}
 }
 
-func processAlert(rdb *redis.Client, containerName, logLine string) {
+func processAlert(rdb *redis.Client, containerName, logLine, projectLabel, metadata string) {
 	// Create a fingerprint of the error
-	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(containerName+logLine[:40])))
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(containerName+truncate(logLine, 40))))
 	redisKey := fmt.Sprintf("watchdog:issue:%s", fingerprint)
 
 	// Check Redis for existing issue ID
@@ -99,11 +109,18 @@ func processAlert(rdb *redis.Client, containerName, logLine string) {
 	}
 
 	// Create new issue
-	newID := createLinearIssue(containerName, logLine)
+	newID := createLinearIssue(containerName, logLine, projectLabel, metadata)
 	if newID != "" {
 		rdb.Set(ctx, redisKey, newID, 0) // Cache indefinitely
 		log.Printf("New Linear issue created for %s: %s", containerName, newID)
 	}
+}
+
+func truncate(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit]
 }
 
 func isIssueResolved(issueID string) bool {
@@ -122,18 +139,34 @@ func isIssueResolved(issueID string) bool {
 	return t == "completed" || t == "canceled"
 }
 
-func createLinearIssue(name, logs string) string {
+func createLinearIssue(name, logs, projectLabel, metadata string) string {
 	gqlClient := graphql.NewClient("https://api.linear.app/graphql")
-	req := graphql.NewRequest(`
-		mutation($teamId: String!, $title: String!, $desc: String!) {
-			issueCreate(input: { teamId: $teamId, title: $title, description: $desc, priority: 2 }) {
-				success issue { id }
+	projectID := strings.TrimSpace(projectLabel)
+	description := fmt.Sprintf("Error detected in container **%s**:\n\n```\n%s\n```\n```%s\n```", name, logs, metadata)
+
+	var req *graphql.Request
+	if projectID != "" {
+		req = graphql.NewRequest(`
+			mutation($teamId: String!, $title: String!, $desc: String!, $projectId: String!) {
+				issueCreate(input: { teamId: $teamId, title: $title, description: $desc, priority: 2, projectId: $projectId }) {
+					success issue { id }
+				}
 			}
-		}
-	`)
+		`)
+		req.Var("projectId", projectID)
+	} else {
+		req = graphql.NewRequest(`
+			mutation($teamId: String!, $title: String!, $desc: String!) {
+				issueCreate(input: { teamId: $teamId, title: $title, description: $desc, priority: 2 }) {
+					success issue { id }
+				}
+			}
+		`)
+	}
+
 	req.Var("teamId", linearTeamID)
 	req.Var("title", fmt.Sprintf("[Log Alert] %s", name))
-	req.Var("desc", fmt.Sprintf("Error detected in container **%s**:\n\n```\n%s\n```", name, logs))
+	req.Var("desc", description)
 	req.Header.Set("Authorization", linearAPIKey)
 
 	var resp struct {
@@ -147,4 +180,21 @@ func createLinearIssue(name, logs string) string {
 		return ""
 	}
 	return resp.IssueCreate.Issue.Id
+}
+
+func getExtendedMetadata(cli *client.Client, containerID string) map[string]string {
+	// 1. Get Container Info (for compose labels)
+	json, _ := cli.ContainerInspect(ctx, containerID)
+	metadata := json.Config.Labels
+
+	// 2. Get Image Info (for baked-in labels like commit hash)
+	imageJSON, _, _ := cli.ImageInspectWithRaw(ctx, json.Image)
+
+	// Merge image labels into our metadata map
+	for k, v := range imageJSON.Config.Labels {
+		if strings.HasPrefix(k, "watchlog.") {
+			metadata[k] = v
+		}
+	}
+	return metadata
 }

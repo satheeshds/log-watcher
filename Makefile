@@ -6,11 +6,11 @@ TAG ?= latest
 
 help:
 	@echo Available targets:
-	@echo   make build    - Build the Docker image
+	@echo   make image    - Build the Docker image
 	@echo   make rebuild  - Rebuild the Docker image without cache
 	@echo   make run      - Run the Docker image locally
 
-build:
+image:
 	docker build -t $(REPO_NAME)/$(IMAGE_NAME):$(TAG) .
 
 rebuild:

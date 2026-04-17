@@ -1,0 +1,62 @@
+
+###
+POST https://api.linear.app/graphql
+Content-Type: application/json
+Authorization: {{$dotenv LINEAR_API_KEY}}
+X-REQUEST-TYPE: GraphQL
+
+query {
+  projects {
+    nodes {
+      id
+      name
+    }
+  }
+}
+
+###
+
+POST https://api.linear.app/graphql
+Content-Type: application/json
+Authorization: {{$dotenv LINEAR_API_KEY}}
+X-REQUEST-TYPE: GraphQL
+
+query($id: String!) { 
+  issue(id: $id) { 
+    state { 
+      type 
+    } 
+  } 
+}
+
+{
+  "id": "ID-44"
+}
+
+
+###
+POST https://api.linear.app/graphql
+Content-Type: application/json
+Authorization: {{$dotenv LINEAR_API_KEY}}
+X-REQUEST-TYPE: GraphQL
+
+query { 
+  issue { 
+    state { 
+      type 
+    }
+  }
+} 
+
+
+###
+curl \
+  -X POST \
+  -H "Content-Type: application/json" \
+  -H "Authorization: {{$dotenv LINEAR_API_KEY}}" \
+  --data '{ "query": " { projects { nodes { id name } } }" }' \
+  https://api.linear.app/graphql
+
+
+  ###
+  `
