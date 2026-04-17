@@ -1,3 +1,4 @@
+REPO_NAME ?= satheeshds
 IMAGE_NAME ?= log-watcher
 TAG ?= latest
 
@@ -10,10 +11,10 @@ help:
 	@echo   make run      - Run the Docker image locally
 
 build:
-	docker build -t $(IMAGE_NAME):$(TAG) .
+	docker build -t $(REPO_NAME)/$(IMAGE_NAME):$(TAG) .
 
 rebuild:
-	docker build --no-cache -t $(IMAGE_NAME):$(TAG) .
+	docker build --no-cache -t $(REPO_NAME)/$(IMAGE_NAME):$(TAG) .
 
 run:
-	docker run --rm --env-file .env $(IMAGE_NAME):$(TAG)
+	docker run --rm --env-file .env $(REPO_NAME)/$(IMAGE_NAME):$(TAG)
