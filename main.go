@@ -9,8 +9,12 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	"github.com/machinebox/graphql"
 	"github.com/redis/go-redis/v9"
@@ -26,6 +30,20 @@ var (
 	linearProjectLabel = "linear.project"
 )
 
+type watcherState struct {
+	generation int
+	cancel     context.CancelFunc
+}
+
+type watcherRegistry struct {
+	mu       sync.Mutex
+	watchers map[string]watcherState
+}
+
+func newWatcherRegistry() *watcherRegistry {
+	return &watcherRegistry{watchers: make(map[string]watcherState)}
+}
+
 func main() {
 	rdb := redis.NewClient(&redis.Options{Addr: redisAddr})
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -33,64 +51,212 @@ func main() {
 		log.Fatalf("Docker Client Error: %v", err)
 	}
 
-	log.Println("Watchlog started. Scanning containers...")
+	registry := newWatcherRegistry()
 
-	// Listen for all containers on the host
-	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
+	log.Println("Watchlog started. Scanning running containers...")
+
+	containers, err := cli.ContainerList(ctx, container.ListOptions{})
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	for _, c := range containers {
 		cName := strings.TrimPrefix(c.Names[0], "/")
-
-		// FILTERING LOGIC:
-		// We only monitor if the label is explicitly set to true
-		if c.Labels[monitorLabel] != "true" {
+		if !shouldMonitorContainer(c.Labels) {
 			log.Printf("Skipping %s (No monitor label found)", cName)
 			continue
 		}
 
-		projectLabel := c.Labels[linearProjectLabel]
-		if projectLabel != "" {
-			log.Printf("Monitoring logs for: %s (Linear project ID: %s)", cName, projectLabel)
-		} else {
-			log.Printf("Monitoring logs for: %s", cName)
-		}
-
-		go tailLogs(cli, rdb, c.ID, cName, projectLabel)
+		registry.start(cli, rdb, c.ID, cName, c.Labels[linearProjectLabel])
 	}
+
+	go watchContainerEvents(cli, rdb, registry)
 
 	select {} // Block forever
 }
 
-func tailLogs(cli *client.Client, rdb *redis.Client, containerID, name, projectLabel string) {
-	options := container.LogsOptions{ShowStdout: true, ShowStderr: true, Follow: true, Tail: "0"}
-	stream, err := cli.ContainerLogs(ctx, containerID, options)
-	if err != nil {
-		log.Printf("Error streaming logs for %s: %v", name, err)
-		return
+func (wr *watcherRegistry) start(cli *client.Client, rdb *redis.Client, containerID, name, projectLabel string) {
+	wr.mu.Lock()
+	current := wr.watchers[containerID]
+	if current.cancel != nil {
+		current.cancel()
 	}
-	defer stream.Close()
 
-	buf := make([]byte, 4096)
+	watchCtx, cancel := context.WithCancel(context.Background())
+	generation := current.generation + 1
+	wr.watchers[containerID] = watcherState{generation: generation, cancel: cancel}
+	wr.mu.Unlock()
+
+	if projectLabel != "" {
+		log.Printf("Monitoring logs for: %s (Linear project ID: %s)", name, projectLabel)
+	} else {
+		log.Printf("Monitoring logs for: %s", name)
+	}
+
+	go func(gen int) {
+		defer wr.finish(containerID, gen)
+		tailLogs(watchCtx, cli, rdb, containerID, name, projectLabel)
+	}(generation)
+}
+
+func (wr *watcherRegistry) stop(containerID string) {
+	wr.mu.Lock()
+	state, ok := wr.watchers[containerID]
+	if ok {
+		delete(wr.watchers, containerID)
+	}
+	wr.mu.Unlock()
+
+	if ok && state.cancel != nil {
+		state.cancel()
+	}
+}
+
+func (wr *watcherRegistry) finish(containerID string, generation int) {
+	wr.mu.Lock()
+	defer wr.mu.Unlock()
+
+	state, ok := wr.watchers[containerID]
+	if ok && state.generation == generation {
+		delete(wr.watchers, containerID)
+	}
+}
+
+func shouldMonitorContainer(labels map[string]string) bool {
+	return labels[monitorLabel] == "true"
+}
+
+func shouldWatchContainerEvent(action events.Action) bool {
+	switch action {
+	case events.ActionStart, events.ActionRestart, events.ActionUnPause:
+		return true
+	default:
+		return false
+	}
+}
+
+func watchContainerEvents(cli *client.Client, rdb *redis.Client, registry *watcherRegistry) {
+	filterArgs := filters.NewArgs(filters.Arg("type", "container"))
+
 	for {
-		n, err := stream.Read(buf)
-		if n > 0 {
-			line := string(buf[:n])
-			upperLine := strings.ToUpper(line)
+		messages, errs := cli.Events(ctx, events.ListOptions{Filters: filterArgs})
 
-			if strings.Contains(upperLine, "ERROR") || strings.Contains(upperLine, "WARNING") {
-				metadata := getExtendedMetadata(cli, containerID)
-				b, _ := json.MarshalIndent(metadata, "", "  ")
-				processAlert(rdb, name, line, projectLabel, string(b))
+		streamClosed := false
+		for !streamClosed {
+			select {
+			case msg, ok := <-messages:
+				if !ok {
+					streamClosed = true
+					continue
+				}
+				handleContainerEvent(cli, rdb, registry, msg)
+			case err, ok := <-errs:
+				if ok && err != nil {
+					log.Printf("Docker event stream error: %v", err)
+				}
+				streamClosed = true
 			}
 		}
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
+
+		select {
+		case <-ctx.Done():
 			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func handleContainerEvent(cli *client.Client, rdb *redis.Client, registry *watcherRegistry, msg events.Message) {
+	action := msg.Action
+	containerID := msg.ID
+
+	switch action {
+	case events.ActionStop, events.ActionDie, events.ActionDestroy, events.ActionPause:
+		registry.stop(containerID)
+		return
+	}
+
+	if !shouldWatchContainerEvent(action) {
+		return
+	}
+
+	name, projectLabel, ok := inspectMonitoredContainer(cli, containerID)
+	if !ok {
+		return
+	}
+
+	registry.start(cli, rdb, containerID, name, projectLabel)
+}
+
+func inspectMonitoredContainer(cli *client.Client, containerID string) (string, string, bool) {
+	info, err := cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		log.Printf("Error inspecting container %s: %v", containerID, err)
+		return "", "", false
+	}
+
+	if info.Config == nil || !shouldMonitorContainer(info.Config.Labels) {
+		return "", "", false
+	}
+
+	return strings.TrimPrefix(info.Name, "/"), info.Config.Labels[linearProjectLabel], true
+}
+
+func tailLogs(watchCtx context.Context, cli *client.Client, rdb *redis.Client, containerID, name, projectLabel string) {
+	options := container.LogsOptions{ShowStdout: true, ShowStderr: true, Follow: true, Tail: "0"}
+	buf := make([]byte, 4096)
+
+	for {
+		if watchCtx.Err() != nil {
+			return
+		}
+
+		stream, err := cli.ContainerLogs(watchCtx, containerID, options)
+		if err != nil {
+			if watchCtx.Err() != nil {
+				return
+			}
+			log.Printf("Error streaming logs for %s: %v", name, err)
+			select {
+			case <-watchCtx.Done():
+				return
+			case <-time.After(2 * time.Second):
+			}
+			continue
+		}
+
+		func() {
+			defer stream.Close()
+
+			for {
+				n, err := stream.Read(buf)
+				if n > 0 {
+					line := string(buf[:n])
+					upperLine := strings.ToUpper(line)
+
+					if strings.Contains(upperLine, "ERROR") || strings.Contains(upperLine, "WARNING") {
+						metadata := getExtendedMetadata(cli, containerID)
+						b, _ := json.MarshalIndent(metadata, "", "  ")
+						processAlert(rdb, name, line, projectLabel, string(b))
+					}
+				}
+
+				if err == io.EOF {
+					return
+				}
+				if err != nil {
+					if watchCtx.Err() == nil {
+						log.Printf("Log stream closed for %s: %v", name, err)
+					}
+					return
+				}
+			}
+		}()
+
+		select {
+		case <-watchCtx.Done():
+			return
+		case <-time.After(1 * time.Second):
 		}
 	}
 }
@@ -185,16 +351,14 @@ func createLinearIssue(name, logs, projectLabel, metadata string) string {
 func getExtendedMetadata(cli *client.Client, containerID string) map[string]string {
 	// 1. Get Container Info (for compose labels)
 	json, _ := cli.ContainerInspect(ctx, containerID)
-	metadata := json.Config.Labels
-
-	// 2. Get Image Info (for baked-in labels like commit hash)
-	imageJSON, _, _ := cli.ImageInspectWithRaw(ctx, json.Image)
-
-	// Merge image labels into our metadata map
-	for k, v := range imageJSON.Config.Labels {
-		if strings.HasPrefix(k, "watchlog.") {
-			metadata[k] = v
+	metadata := make(map[string]string)
+	for k, v := range json.Config.Labels {
+		// we need to filter for watchlog.* labels to avoid dumping everything into the issue description
+		// and set the key as the suffix after watchlog. so it's easier to read in the issue description
+		if after, ok := strings.CutPrefix(k, "watchlog."); ok {
+			metadata[after] = v
 		}
 	}
+
 	return metadata
 }
