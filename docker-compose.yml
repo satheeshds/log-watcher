@@ -1,0 +1,19 @@
+services:
+  log-watcher:
+    build: .
+    depends_on:
+      - redis
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro # Mandatory for Docker API
+    environment:
+      - LINEAR_API_KEY=lin_api_xxxx
+      - LINEAR_TEAM_ID=your_team_uuid
+      - REDIS_ADDR=redis:6379
+    restart: unless-stopped
+    # Use a network that can reach the internet for Linear API
+    networks:
+      - app_network
+
+networks:
+  app_network:
+    driver: bridge
