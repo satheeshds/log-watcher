@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"testing"
 
 	"github.com/docker/docker/api/types/events"
@@ -35,5 +37,89 @@ func TestShouldWatchContainerEvent(t *testing.T) {
 		if shouldWatchContainerEvent(action) {
 			t.Fatalf("expected %q not to trigger log watching", action)
 		}
+	}
+}
+
+func TestNormalizeLogLine(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "ISO 8601 timestamp with Z",
+			input: "2024-01-15T10:30:45.123Z ERROR: connection refused",
+			want:  "<TIMESTAMP> ERROR: connection refused",
+		},
+		{
+			name:  "ISO 8601 timestamp with timezone offset",
+			input: "2024-01-15T10:30:45+05:30 ERROR: disk full",
+			want:  "<TIMESTAMP> ERROR: disk full",
+		},
+		{
+			name:  "ISO 8601 timestamp with space separator",
+			input: "2024-01-15 10:30:45.000 ERROR: out of memory",
+			want:  "<TIMESTAMP> ERROR: out of memory",
+		},
+		{
+			name:  "syslog-style timestamp",
+			input: "Jan 15 10:30:45 hostname app[1234]: ERROR: panic",
+			want:  "<TIMESTAMP> hostname app[<NUM>]: ERROR: panic",
+		},
+		{
+			name:  "UUID replaced",
+			input: "ERROR: request 550e8400-e29b-41d4-a716-446655440000 failed",
+			want:  "ERROR: request <UUID> failed",
+		},
+		{
+			name:  "IP address replaced",
+			input: "ERROR: cannot connect to 192.168.1.100:5432",
+			want:  "ERROR: cannot connect to <IP>",
+		},
+		{
+			name:  "hex trace ID replaced",
+			input: "ERROR: trace=deadbeef12345678 span failed",
+			want:  "ERROR: trace=<HEXID> span failed",
+		},
+		{
+			name:  "standalone numbers replaced",
+			input: "ERROR: retry 3 of 5 failed after 2000ms",
+			want:  "ERROR: retry <NUM> of <NUM> failed after <NUM>ms",
+		},
+		{
+			name:  "same error different timestamps produce identical normalized form",
+			input: "2024-06-01T08:00:00Z ERROR: database connection failed",
+			want:  "<TIMESTAMP> ERROR: database connection failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := normalizeLogLine(tt.input)
+			if got != tt.want {
+				t.Fatalf("normalizeLogLine(%q)\n  got  %q\n  want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestFingerprintDeduplication verifies that the same logical error with
+// different timestamps produces an identical fingerprint.
+func TestFingerprintDeduplication(t *testing.T) {
+	container := "my-service"
+	line1 := "2024-01-01T10:00:00Z ERROR: database connection failed after 3 retries"
+	line2 := "2024-06-15T23:59:59.999Z ERROR: database connection failed after 3 retries"
+	line3 := "2024-01-01T10:00:00Z ERROR: completely different error"
+
+	fp := func(line string) string {
+		n := normalizeLogLine(line)
+		return fmt.Sprintf("%x", sha256.Sum256([]byte(container+truncate(n, 120))))
+	}
+
+	if fp(line1) != fp(line2) {
+		t.Fatalf("expected same fingerprint for same error with different timestamps\n  fp1=%s\n  fp2=%s", fp(line1), fp(line2))
+	}
+	if fp(line1) == fp(line3) {
+		t.Fatalf("expected different fingerprints for different errors")
 	}
 }

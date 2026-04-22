@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,36 @@ var (
 	monitorLabel       = "watchlog.monitor"
 	linearProjectLabel = "linear.project"
 )
+
+// Compiled regexes used by normalizeLogLine to strip dynamic tokens from log
+// lines before computing a deduplication fingerprint.
+var (
+	// ISO 8601 / RFC 3339: 2024-01-01T10:00:00, 2024-01-01 10:00:00.000Z, …
+	reTimestamp = regexp.MustCompile(`\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?`)
+	// Syslog-style: Jan  1 10:00:00
+	reSyslogTimestamp = regexp.MustCompile(`(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}`)
+	// UUIDs: 550e8400-e29b-41d4-a716-446655440000
+	reUUID = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+	// IPv4 addresses (with optional port): 192.168.1.1, 10.0.0.1:8080
+	reIP = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?\b`)
+	// Hex identifiers / trace IDs (8+ consecutive hex chars)
+	reHexID = regexp.MustCompile(`\b[0-9a-fA-F]{8,}\b`)
+	// Standalone decimal numbers (may be followed by a unit suffix, e.g. 2000ms)
+	reNumber = regexp.MustCompile(`\b\d+`)
+)
+
+// normalizeLogLine replaces dynamic tokens (timestamps, IDs, IPs, numbers) in a
+// log line with stable placeholders so that semantically identical errors always
+// produce the same deduplication fingerprint.
+func normalizeLogLine(line string) string {
+	line = reTimestamp.ReplaceAllString(line, "<TIMESTAMP>")
+	line = reSyslogTimestamp.ReplaceAllString(line, "<TIMESTAMP>")
+	line = reUUID.ReplaceAllString(line, "<UUID>")
+	line = reIP.ReplaceAllString(line, "<IP>")
+	line = reHexID.ReplaceAllString(line, "<HEXID>")
+	line = reNumber.ReplaceAllString(line, "<NUM>")
+	return line
+}
 
 type watcherState struct {
 	generation int
@@ -262,8 +293,11 @@ func tailLogs(watchCtx context.Context, cli *client.Client, rdb *redis.Client, c
 }
 
 func processAlert(rdb *redis.Client, containerName, logLine, projectLabel, metadata string) {
-	// Create a fingerprint of the error
-	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(containerName+truncate(logLine, 40))))
+	// Normalize the log line to strip dynamic tokens (timestamps, IDs, numbers)
+	// so that the same error always maps to the same fingerprint, regardless of
+	// when or how many times it appears in the logs.
+	normalized := normalizeLogLine(logLine)
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(containerName+truncate(normalized, 120))))
 	redisKey := fmt.Sprintf("watchdog:issue:%s", fingerprint)
 
 	// Check Redis for existing issue ID
