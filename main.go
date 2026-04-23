@@ -44,7 +44,8 @@ var (
 	reIP = regexp.MustCompile(`\b(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)){3}(?::\d+)?\b`)
 	// Hex identifiers / trace IDs (8+ consecutive hex chars)
 	reHexID = regexp.MustCompile(`\b[0-9a-fA-F]{8,}\b`)
-	// Standalone decimal numbers (may be followed by a unit suffix, e.g. 2000ms)
+	// Decimal digit sequences that start at a word boundary (including values with
+	// a trailing unit suffix, e.g. 2000ms)
 	reNumber = regexp.MustCompile(`\b\d+`)
 )
 
