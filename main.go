@@ -40,8 +40,8 @@ var (
 	reSyslogTimestamp = regexp.MustCompile(`(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}`)
 	// UUIDs: 550e8400-e29b-41d4-a716-446655440000
 	reUUID = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
-	// IPv4 addresses (with optional port): 192.168.1.1, 10.0.0.1:8080
-	reIP = regexp.MustCompile(`\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(?::\d+)?\b`)
+	// IPv4 addresses with valid 0-255 octets (and optional port): 192.168.1.1, 10.0.0.1:8080
+	reIP = regexp.MustCompile(`\b(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d{2}|[1-9]?\d)){3}(?::\d+)?\b`)
 	// Hex identifiers / trace IDs (8+ consecutive hex chars)
 	reHexID = regexp.MustCompile(`\b[0-9a-fA-F]{8,}\b`)
 	// Standalone decimal numbers (may be followed by a unit suffix, e.g. 2000ms)
