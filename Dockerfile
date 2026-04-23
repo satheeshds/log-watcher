@@ -12,10 +12,13 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /log-watcher .
 
 FROM alpine:3.20
 
+ARG COMMIT_SHA
+
 RUN apk add --no-cache ca-certificates tzdata
 
 WORKDIR /app
 COPY --from=builder /log-watcher /usr/local/bin/log-watcher
 
+LABEL COMMIT_SHA=$COMMIT_SHA
 
 CMD ["/usr/local/bin/log-watcher"]
