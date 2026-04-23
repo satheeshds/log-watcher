@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -17,6 +18,7 @@ import (
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/machinebox/graphql"
 	"github.com/redis/go-redis/v9"
 )
@@ -236,7 +238,6 @@ func inspectMonitoredContainer(cli *client.Client, containerID string) (string, 
 
 func tailLogs(watchCtx context.Context, cli *client.Client, rdb *redis.Client, containerID, name, projectLabel string) {
 	options := container.LogsOptions{ShowStdout: true, ShowStderr: true, Follow: true, Tail: "0"}
-	buf := make([]byte, 4096)
 
 	for {
 		if watchCtx.Err() != nil {
@@ -260,29 +261,34 @@ func tailLogs(watchCtx context.Context, cli *client.Client, rdb *redis.Client, c
 		func() {
 			defer stream.Close()
 
-			for {
-				n, err := stream.Read(buf)
-				if n > 0 {
-					line := string(buf[:n])
-					upperLine := strings.ToUpper(line)
+			// Docker container logs arrive as a multiplexed stream with 8-byte
+			// framing headers (stdout vs stderr). stdcopy.StdCopy strips those
+			// headers and writes clean UTF-8 text to the provided writers.
+			// We merge both stdout and stderr into a single pipe so that a
+			// bufio.Scanner can process one complete log line at a time.
+			pr, pw := io.Pipe()
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, copyErr := stdcopy.StdCopy(pw, pw, stream)
+				pw.CloseWithError(copyErr)
+			}()
 
-					if strings.Contains(upperLine, "ERROR") || strings.Contains(upperLine, "WARNING") {
-						metadata := getExtendedMetadata(cli, containerID)
-						b, _ := json.MarshalIndent(metadata, "", "  ")
-						processAlert(rdb, name, line, projectLabel, string(b))
-					}
-				}
-
-				if err == io.EOF {
-					return
-				}
-				if err != nil {
-					if watchCtx.Err() == nil {
-						log.Printf("Log stream closed for %s: %v", name, err)
-					}
-					return
+			scanner := bufio.NewScanner(pr)
+			for scanner.Scan() {
+				line := scanner.Text()
+				upperLine := strings.ToUpper(line)
+				if strings.Contains(upperLine, "ERROR") || strings.Contains(upperLine, "WARNING") {
+					metadata := getExtendedMetadata(cli, containerID)
+					b, _ := json.MarshalIndent(metadata, "", "  ")
+					processAlert(rdb, name, line, projectLabel, string(b))
 				}
 			}
+			if err := scanner.Err(); err != nil && watchCtx.Err() == nil {
+				log.Printf("Log scanner error for %s: %v", name, err)
+			}
+			wg.Wait()
 		}()
 
 		select {
@@ -305,7 +311,11 @@ func processAlert(rdb *redis.Client, containerName, logLine, projectLabel, metad
 	// Acquire a short-lived creation lock to prevent concurrent goroutines from
 	// creating duplicate issues for the same fingerprint.
 	locked, err := rdb.SetNX(ctx, lockKey, "1", 60*time.Second).Result()
-	if err != nil || !locked {
+	if err != nil {
+		log.Printf("Redis error acquiring lock for %s: %v; skipping to avoid duplicates", fingerprint, err)
+		return
+	}
+	if !locked {
 		return // Another goroutine is already processing this fingerprint
 	}
 	defer rdb.Del(ctx, lockKey)
