@@ -87,7 +87,7 @@ func TestNormalizeLogLine(t *testing.T) {
 			want:  "ERROR: retry <NUM> of <NUM> failed after <NUM>ms",
 		},
 		{
-			name:  "same error different timestamps produce identical normalized form",
+			name:  "timestamped error message normalized",
 			input: "2024-06-01T08:00:00Z ERROR: database connection failed",
 			want:  "<TIMESTAMP> ERROR: database connection failed",
 		},
