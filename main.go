@@ -300,6 +300,15 @@ func processAlert(rdb *redis.Client, containerName, logLine, projectLabel, metad
 	normalized := normalizeLogLine(logLine)
 	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(containerName+truncate(normalized, 120))))
 	redisKey := fmt.Sprintf("watchdog:issue:%s", fingerprint)
+	lockKey := fmt.Sprintf("watchdog:lock:%s", fingerprint)
+
+	// Acquire a short-lived creation lock to prevent concurrent goroutines from
+	// creating duplicate issues for the same fingerprint.
+	locked, err := rdb.SetNX(ctx, lockKey, "1", 60*time.Second).Result()
+	if err != nil || !locked {
+		return // Another goroutine is already processing this fingerprint
+	}
+	defer rdb.Del(ctx, lockKey)
 
 	// Check Redis for existing issue ID
 	issueID, err := rdb.Get(ctx, redisKey).Result()
@@ -334,7 +343,8 @@ func isIssueResolved(issueID string) bool {
 		Issue struct{ State struct{ Type string } }
 	}
 	if err := gqlClient.Run(ctx, req, &resp); err != nil {
-		return true // Create new if API fails
+		log.Printf("Linear API error checking issue %s: %v; assuming not resolved to avoid duplicates", issueID, err)
+		return false // Conservative: assume open so we don't create a duplicate
 	}
 	t := resp.Issue.State.Type
 	return t == "completed" || t == "canceled"

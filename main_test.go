@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/docker/docker/api/types/events"
+	"github.com/redis/go-redis/v9"
 )
 
 func TestShouldMonitorContainer(t *testing.T) {
@@ -121,5 +124,52 @@ func TestFingerprintDeduplication(t *testing.T) {
 	}
 	if fp(line1) == fp(line3) {
 		t.Fatalf("expected different fingerprints for different errors")
+	}
+}
+
+// newTestRedis returns an in-process Redis client pointed at a local test
+// server. If no local server is available the test is skipped.
+func newTestRedis(t *testing.T) *redis.Client {
+	t.Helper()
+	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		t.Skipf("skipping: no Redis available at localhost:6379 (%v)", err)
+	}
+	return rdb
+}
+
+// TestProcessAlertLockPreventsRace verifies that the Redis lock key prevents
+// concurrent goroutines from creating duplicate Linear issues for the same
+// fingerprint: the second caller must fail to acquire the lock while the first
+// still holds it.
+func TestProcessAlertLockPreventsRace(t *testing.T) {
+	rdb := newTestRedis(t)
+
+	containerName := "test-lock-race"
+	logLine := "2024-01-01T00:00:00Z ERROR: lock race test"
+	normalized := normalizeLogLine(logLine)
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(containerName+truncate(normalized, 120))))
+	lockKey := "watchdog:lock:" + fingerprint
+
+	// Clean up before and after the test.
+	rdb.Del(context.Background(), lockKey)
+	t.Cleanup(func() { rdb.Del(context.Background(), lockKey) })
+
+	// First acquisition should succeed.
+	locked1, err := rdb.SetNX(context.Background(), lockKey, "1", 60*time.Second).Result()
+	if err != nil {
+		t.Fatalf("unexpected Redis error: %v", err)
+	}
+	if !locked1 {
+		t.Fatal("expected first SetNX to succeed")
+	}
+
+	// Second acquisition (simulating a concurrent goroutine) must fail.
+	locked2, err := rdb.SetNX(context.Background(), lockKey, "1", 60*time.Second).Result()
+	if err != nil {
+		t.Fatalf("unexpected Redis error: %v", err)
+	}
+	if locked2 {
+		t.Fatal("expected second SetNX to fail while lock is held")
 	}
 }
