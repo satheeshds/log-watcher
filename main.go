@@ -3,7 +3,9 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -276,6 +278,12 @@ func tailLogs(watchCtx context.Context, cli *client.Client, rdb *redis.Client, c
 			}()
 
 			scanner := bufio.NewScanner(pr)
+			// Raise the token limit to 1 MiB so abnormally long lines do not
+			// trigger ErrTooLong. On any scan error we close the read-end of
+			// the pipe so the stdcopy goroutine can drain and exit without
+			// blocking, then we wait for it before returning.
+			const maxScanToken = 1024 * 1024
+			scanner.Buffer(make([]byte, maxScanToken), maxScanToken)
 			for scanner.Scan() {
 				line := scanner.Text()
 				upperLine := strings.ToUpper(line)
@@ -288,6 +296,8 @@ func tailLogs(watchCtx context.Context, cli *client.Client, rdb *redis.Client, c
 			if err := scanner.Err(); err != nil && watchCtx.Err() == nil {
 				log.Printf("Log scanner error for %s: %v", name, err)
 			}
+			// Close the reader so stdcopy can finish writing and exit.
+			pr.CloseWithError(io.EOF)
 			wg.Wait()
 		}()
 
@@ -299,6 +309,16 @@ func tailLogs(watchCtx context.Context, cli *client.Client, rdb *redis.Client, c
 	}
 }
 
+// luaReleaseLock is a Lua CAS script that deletes a Redis lock only when the
+// stored value matches the caller's token, preventing accidental release of a
+// lock owned by a different goroutine after TTL expiry and re-acquisition.
+const luaReleaseLock = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end`
+
 func processAlert(rdb *redis.Client, containerName, logLine, projectLabel, metadata string) {
 	// Normalize the log line to strip dynamic tokens (timestamps, IDs, numbers)
 	// so that the same error always maps to the same fingerprint, regardless of
@@ -308,9 +328,18 @@ func processAlert(rdb *redis.Client, containerName, logLine, projectLabel, metad
 	redisKey := fmt.Sprintf("watchdog:issue:%s", fingerprint)
 	lockKey := fmt.Sprintf("watchdog:lock:%s", fingerprint)
 
+	// Generate a unique token so we only delete the lock we own, even if the
+	// TTL expires and another goroutine re-acquires the key before we finish.
+	tokenBytes := make([]byte, 16)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		log.Printf("Failed to generate lock token for %s: %v; skipping", fingerprint, err)
+		return
+	}
+	lockToken := hex.EncodeToString(tokenBytes)
+
 	// Acquire a short-lived creation lock to prevent concurrent goroutines from
 	// creating duplicate issues for the same fingerprint.
-	locked, err := rdb.SetNX(ctx, lockKey, "1", 60*time.Second).Result()
+	locked, err := rdb.SetNX(ctx, lockKey, lockToken, 60*time.Second).Result()
 	if err != nil {
 		log.Printf("Redis error acquiring lock for %s: %v; skipping to avoid duplicates", fingerprint, err)
 		return
@@ -318,7 +347,12 @@ func processAlert(rdb *redis.Client, containerName, logLine, projectLabel, metad
 	if !locked {
 		return // Another goroutine is already processing this fingerprint
 	}
-	defer rdb.Del(ctx, lockKey)
+	// Release the lock only if we still own it (compare-and-delete via Lua).
+	defer func() {
+		if err := rdb.Eval(ctx, luaReleaseLock, []string{lockKey}, lockToken).Err(); err != nil {
+			log.Printf("Redis error releasing lock %s: %v", lockKey, err)
+		}
+	}()
 
 	// Check Redis for existing issue ID
 	issueID, err := rdb.Get(ctx, redisKey).Result()

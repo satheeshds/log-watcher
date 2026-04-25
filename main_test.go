@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/docker/docker/api/types/events"
 	"github.com/redis/go-redis/v9"
 )
@@ -127,22 +128,20 @@ func TestFingerprintDeduplication(t *testing.T) {
 	}
 }
 
-// newTestRedis returns an in-process Redis client pointed at a local test
-// server. If no local server is available the test is skipped.
+// newTestRedis starts an in-process miniredis server and returns a connected
+// client. The server and client are both closed automatically via t.Cleanup.
 func newTestRedis(t *testing.T) *redis.Client {
 	t.Helper()
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
-	if err := rdb.Ping(context.Background()).Err(); err != nil {
-		t.Skipf("skipping: no Redis available at localhost:6379 (%v)", err)
-	}
+	s := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	t.Cleanup(func() { rdb.Close() })
 	return rdb
 }
 
-// TestProcessAlertLockPreventsRace verifies that the Redis lock key prevents
-// concurrent goroutines from creating duplicate Linear issues for the same
-// fingerprint: the second caller must fail to acquire the lock while the first
-// still holds it.
-func TestProcessAlertLockPreventsRace(t *testing.T) {
+// TestRedisLockKeyPreventsRace verifies that a Redis SetNX lock key prevents a
+// concurrent goroutine from acquiring the same key while it is held, which is
+// the mechanism used by processAlert to avoid duplicate issue creation.
+func TestRedisLockKeyPreventsRace(t *testing.T) {
 	rdb := newTestRedis(t)
 
 	containerName := "test-lock-race"
@@ -151,12 +150,8 @@ func TestProcessAlertLockPreventsRace(t *testing.T) {
 	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(containerName+truncate(normalized, 120))))
 	lockKey := "watchdog:lock:" + fingerprint
 
-	// Clean up before and after the test.
-	rdb.Del(context.Background(), lockKey)
-	t.Cleanup(func() { rdb.Del(context.Background(), lockKey) })
-
 	// First acquisition should succeed.
-	locked1, err := rdb.SetNX(context.Background(), lockKey, "1", 60*time.Second).Result()
+	locked1, err := rdb.SetNX(context.Background(), lockKey, "token-a", 60*time.Second).Result()
 	if err != nil {
 		t.Fatalf("unexpected Redis error: %v", err)
 	}
@@ -165,7 +160,7 @@ func TestProcessAlertLockPreventsRace(t *testing.T) {
 	}
 
 	// Second acquisition (simulating a concurrent goroutine) must fail.
-	locked2, err := rdb.SetNX(context.Background(), lockKey, "1", 60*time.Second).Result()
+	locked2, err := rdb.SetNX(context.Background(), lockKey, "token-b", 60*time.Second).Result()
 	if err != nil {
 		t.Fatalf("unexpected Redis error: %v", err)
 	}
