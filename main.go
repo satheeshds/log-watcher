@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +20,7 @@ import (
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/machinebox/graphql"
 	"github.com/redis/go-redis/v9"
 )
@@ -236,7 +240,6 @@ func inspectMonitoredContainer(cli *client.Client, containerID string) (string, 
 
 func tailLogs(watchCtx context.Context, cli *client.Client, rdb *redis.Client, containerID, name, projectLabel string) {
 	options := container.LogsOptions{ShowStdout: true, ShowStderr: true, Follow: true, Tail: "0"}
-	buf := make([]byte, 4096)
 
 	for {
 		if watchCtx.Err() != nil {
@@ -260,29 +263,42 @@ func tailLogs(watchCtx context.Context, cli *client.Client, rdb *redis.Client, c
 		func() {
 			defer stream.Close()
 
-			for {
-				n, err := stream.Read(buf)
-				if n > 0 {
-					line := string(buf[:n])
-					upperLine := strings.ToUpper(line)
+			// Docker container logs arrive as a multiplexed stream with 8-byte
+			// framing headers (stdout vs stderr). stdcopy.StdCopy strips those
+			// headers and writes clean UTF-8 text to the provided writers.
+			// We merge both stdout and stderr into a single pipe so that a
+			// bufio.Scanner can process one complete log line at a time.
+			pr, pw := io.Pipe()
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, copyErr := stdcopy.StdCopy(pw, pw, stream)
+				pw.CloseWithError(copyErr)
+			}()
 
-					if strings.Contains(upperLine, "ERROR") || strings.Contains(upperLine, "WARNING") {
-						metadata := getExtendedMetadata(cli, containerID)
-						b, _ := json.MarshalIndent(metadata, "", "  ")
-						processAlert(rdb, name, line, projectLabel, string(b))
-					}
-				}
-
-				if err == io.EOF {
-					return
-				}
-				if err != nil {
-					if watchCtx.Err() == nil {
-						log.Printf("Log stream closed for %s: %v", name, err)
-					}
-					return
+			scanner := bufio.NewScanner(pr)
+			// Raise the token limit to 1 MiB so abnormally long lines do not
+			// trigger ErrTooLong. On any scan error we close the read-end of
+			// the pipe so the stdcopy goroutine can drain and exit without
+			// blocking, then we wait for it before returning.
+			const maxScanToken = 1024 * 1024
+			scanner.Buffer(make([]byte, maxScanToken), maxScanToken)
+			for scanner.Scan() {
+				line := scanner.Text()
+				upperLine := strings.ToUpper(line)
+				if strings.Contains(upperLine, "ERROR") || strings.Contains(upperLine, "WARNING") {
+					metadata := getExtendedMetadata(cli, containerID)
+					b, _ := json.MarshalIndent(metadata, "", "  ")
+					processAlert(rdb, name, line, projectLabel, string(b))
 				}
 			}
+			if err := scanner.Err(); err != nil && watchCtx.Err() == nil {
+				log.Printf("Log scanner error for %s: %v", name, err)
+			}
+			// Close the reader so stdcopy can finish writing and exit.
+			pr.CloseWithError(io.EOF)
+			wg.Wait()
 		}()
 
 		select {
@@ -293,6 +309,16 @@ func tailLogs(watchCtx context.Context, cli *client.Client, rdb *redis.Client, c
 	}
 }
 
+// luaReleaseLock is a Lua CAS script that deletes a Redis lock only when the
+// stored value matches the caller's token, preventing accidental release of a
+// lock owned by a different goroutine after TTL expiry and re-acquisition.
+const luaReleaseLock = `
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+    return redis.call("DEL", KEYS[1])
+else
+    return 0
+end`
+
 func processAlert(rdb *redis.Client, containerName, logLine, projectLabel, metadata string) {
 	// Normalize the log line to strip dynamic tokens (timestamps, IDs, numbers)
 	// so that the same error always maps to the same fingerprint, regardless of
@@ -300,6 +326,33 @@ func processAlert(rdb *redis.Client, containerName, logLine, projectLabel, metad
 	normalized := normalizeLogLine(logLine)
 	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(containerName+truncate(normalized, 120))))
 	redisKey := fmt.Sprintf("watchdog:issue:%s", fingerprint)
+	lockKey := fmt.Sprintf("watchdog:lock:%s", fingerprint)
+
+	// Generate a unique token so we only delete the lock we own, even if the
+	// TTL expires and another goroutine re-acquires the key before we finish.
+	tokenBytes := make([]byte, 16)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		log.Printf("Failed to generate lock token for %s: %v; skipping", fingerprint, err)
+		return
+	}
+	lockToken := hex.EncodeToString(tokenBytes)
+
+	// Acquire a short-lived creation lock to prevent concurrent goroutines from
+	// creating duplicate issues for the same fingerprint.
+	locked, err := rdb.SetNX(ctx, lockKey, lockToken, 60*time.Second).Result()
+	if err != nil {
+		log.Printf("Redis error acquiring lock for %s: %v; skipping to avoid duplicates", fingerprint, err)
+		return
+	}
+	if !locked {
+		return // Another goroutine is already processing this fingerprint
+	}
+	// Release the lock only if we still own it (compare-and-delete via Lua).
+	defer func() {
+		if err := rdb.Eval(ctx, luaReleaseLock, []string{lockKey}, lockToken).Err(); err != nil {
+			log.Printf("Redis error releasing lock %s: %v", lockKey, err)
+		}
+	}()
 
 	// Check Redis for existing issue ID
 	issueID, err := rdb.Get(ctx, redisKey).Result()
@@ -334,7 +387,8 @@ func isIssueResolved(issueID string) bool {
 		Issue struct{ State struct{ Type string } }
 	}
 	if err := gqlClient.Run(ctx, req, &resp); err != nil {
-		return true // Create new if API fails
+		log.Printf("Linear API error checking issue %s: %v; assuming not resolved to avoid duplicates", issueID, err)
+		return false // Conservative: assume open so we don't create a duplicate
 	}
 	t := resp.Issue.State.Type
 	return t == "completed" || t == "canceled"

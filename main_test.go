@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"testing"
+	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/docker/docker/api/types/events"
+	"github.com/redis/go-redis/v9"
 )
 
 func TestShouldMonitorContainer(t *testing.T) {
@@ -121,5 +125,46 @@ func TestFingerprintDeduplication(t *testing.T) {
 	}
 	if fp(line1) == fp(line3) {
 		t.Fatalf("expected different fingerprints for different errors")
+	}
+}
+
+// newTestRedis starts an in-process miniredis server and returns a connected
+// client. The server and client are both closed automatically via t.Cleanup.
+func newTestRedis(t *testing.T) *redis.Client {
+	t.Helper()
+	s := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: s.Addr()})
+	t.Cleanup(func() { rdb.Close() })
+	return rdb
+}
+
+// TestRedisLockKeyPreventsRace verifies that a Redis SetNX lock key prevents a
+// concurrent goroutine from acquiring the same key while it is held, which is
+// the mechanism used by processAlert to avoid duplicate issue creation.
+func TestRedisLockKeyPreventsRace(t *testing.T) {
+	rdb := newTestRedis(t)
+
+	containerName := "test-lock-race"
+	logLine := "2024-01-01T00:00:00Z ERROR: lock race test"
+	normalized := normalizeLogLine(logLine)
+	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(containerName+truncate(normalized, 120))))
+	lockKey := "watchdog:lock:" + fingerprint
+
+	// First acquisition should succeed.
+	locked1, err := rdb.SetNX(context.Background(), lockKey, "token-a", 60*time.Second).Result()
+	if err != nil {
+		t.Fatalf("unexpected Redis error: %v", err)
+	}
+	if !locked1 {
+		t.Fatal("expected first SetNX to succeed")
+	}
+
+	// Second acquisition (simulating a concurrent goroutine) must fail.
+	locked2, err := rdb.SetNX(context.Background(), lockKey, "token-b", 60*time.Second).Result()
+	if err != nil {
+		t.Fatalf("unexpected Redis error: %v", err)
+	}
+	if locked2 {
+		t.Fatal("expected second SetNX to fail while lock is held")
 	}
 }
